@@ -1238,30 +1238,86 @@ local FOVCircle = NewDraw("Circle", {
     Visible = false
 })
 
-local function IsVisible(targetPart, char)
+local function IsVisible(targetPart)
     local origin = Camera.CFrame.Position
     local dir = targetPart.Position - origin
+
+    -- Определяем персонажа, которому принадлежит часть (устойчиво к вложенности).
+    local targetChar = nil
+    for _, pl in pairs(Players:GetPlayers()) do
+        if pl.Character and targetPart:IsDescendantOf(pl.Character) then
+            targetChar = pl.Character
+            break
+        end
+    end
+
     local params = RaycastParams.new()
-    params.FilterDescendantsInstances = { LocalPlayer.Character, char }
+    local filter = {}
+    for _, pl in pairs(Players:GetPlayers()) do
+        -- Исключаем всех персонажей, КРОМЕ цели:
+        -- 1) союзники не блокируют луч до цели;
+        -- 2) луч упирается в тело самой цели и не "пробивает" его насквозь
+        --    до стены, стоящей вплотную за спиной (ложное "не видно").
+        if pl.Character and pl.Character ~= targetChar then
+            filter[#filter + 1] = pl.Character
+        end
+    end
+    params.FilterDescendantsInstances = filter
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.IgnoreWater = true
+
     local result = Workspace:Raycast(origin, dir, params)
-    return result == nil
+    if not result then
+        -- Ни во что не попали — цели на линии нет (считаем невидимой).
+        return false
+    end
+
+    if targetChar then
+        -- Упёрлись в часть самой цели — видима; в стену/препятствие — нет.
+        return result.Instance:IsDescendantOf(targetChar)
+    end
+
+    -- Часть не принадлежит игроку (редкий случай) — видима, только если
+    -- луч упёрся непосредственно в неё.
+    return result.Instance == targetPart or result.Instance:IsDescendantOf(targetPart)
 end
+
+-- Типовые названия частей тела (R6/R15). Режим "Closest" выбирает только
+-- скелет, а не любые декоративные BasePart-дети персонажа.
+local BODY_PART_NAMES = {
+    Head = true, Torso = true, UpperTorso = true, LowerTorso = true,
+    HumanoidRootPart = true,
+    LeftArm = true, RightArm = true, LeftUpperArm = true, RightUpperArm = true,
+    LeftLowerArm = true, RightLowerArm = true, LeftHand = true, RightHand = true,
+    LeftLeg = true, RightLeg = true, LeftUpperLeg = true, RightUpperLeg = true,
+    LeftLowerLeg = true, RightLowerLeg = true, LeftFoot = true, RightFoot = true
+}
 
 local function GetTargetParts(ch)
     local head = ch:FindFirstChild("Head")
     local torso = ch:FindFirstChild("UpperTorso") or ch:FindFirstChild("Torso") or ch:FindFirstChild("HumanoidRootPart")
     if Aura.Aimbot.Mode == "Head" then
-        return { head }
+        -- Фолбэк на торс: у нестандартных моделей части Head может не быть,
+        -- иначе цель просто не находилась бы (возвращался { nil }).
+        return { head or torso }
     elseif Aura.Aimbot.Mode == "Torso" then
         return { torso }
     elseif Aura.Aimbot.Mode == "Hybrid" then
         return { head, torso }
     else
+        -- "Closest": только части скелета по типовым именам.
         local parts = {}
         for _, p in pairs(ch:GetChildren()) do
-            if p:IsA("BasePart") then parts[#parts + 1] = p end
+            if p:IsA("BasePart") and BODY_PART_NAMES[p.Name] then
+                parts[#parts + 1] = p
+            end
+        end
+        -- Фолбэк для кастомных моделей: если по именам ничего не нашлось,
+        -- берём все BasePart-дети (прежнее поведение).
+        if #parts == 0 then
+            for _, p in pairs(ch:GetChildren()) do
+                if p:IsA("BasePart") then parts[#parts + 1] = p end
+            end
         end
         return parts
     end
@@ -1270,6 +1326,23 @@ end
 local function HasActiveTeamFilter()
     for _, v in pairs(Aura.Aimbot.TeamFilter) do
         if v then return true end
+    end
+    return false
+end
+
+-- Проверяет, выбран ли фильтр, соответствующий касте игрока.
+-- Ключи фильтра — "красивые" названия из UI (напр. "US Army"), а GetTeamInfo
+-- возвращает lowercase-ключ (напр. "us army" или просто "army"), поэтому
+-- сравниваем регистронезависимо и в обе стороны по подстроке:
+-- "us army" == "army" не сработает, а "us army":find("army") — да.
+local function TeamMatchesFilter(teamKey)
+    for fName, fActive in pairs(Aura.Aimbot.TeamFilter) do
+        if fActive then
+            local f = fName:lower()
+            if f == teamKey or teamKey:find(f, 1, true) or f:find(teamKey, 1, true) then
+                return true
+            end
+        end
     end
     return false
 end
@@ -1288,25 +1361,22 @@ local function GetBestTarget()
 
             if filterActive then
                 local _, _, teamKey = GetTeamInfo(pl)
-                if not Aura.Aimbot.TeamFilter[teamKey] then
-                    local matched = false
-                    for fName, fActive in pairs(Aura.Aimbot.TeamFilter) do
-                        if fActive and teamKey:find(fName:lower(), 1, true) then
-                            matched = true; break
-                        end
-                    end
-                    if not matched then continue end
-                end
+                if not TeamMatchesFilter(teamKey) then continue end
             end
 
             local parts = GetTargetParts(ch)
             for _, part in pairs(parts) do
                 if part then
                     local pos, onScreen = Camera:WorldToViewportPoint(part.Position)
-                    if onScreen then
-                        local screenDist = (Vector2.new(cx, cy) - Vector2.new(pos.X, pos.Y)).Magnitude
+                    -- pos.Z > 0 — цель впереди камеры. Для цели за спиной проекция
+                    -- "отзеркаливается", onScreen бывает true, и прицел резко
+                    -- разворачивается на 180°. Проверка глубины это исключает.
+                    if onScreen and pos.Z > 0 then
+                        -- Смещение по Y учитывается и в FOV-гейте (как в наведении).
+                        local aimY = pos.Y + Aura.Aimbot.OffsetY
+                        local screenDist = (Vector2.new(cx, cy) - Vector2.new(pos.X, aimY)).Magnitude
                         if screenDist <= Aura.Aimbot.FOV then
-                            if not Aura.Aimbot.WallCheck or IsVisible(part, ch) then
+                            if not Aura.Aimbot.WallCheck or IsVisible(part) then
                                 local score = 0
                                 if Aura.Aimbot.Priority == "Crosshair" then
                                     score = screenDist
@@ -1450,7 +1520,11 @@ Conn(RunService.RenderStepped, function(dt)
     end
 
     -- 3. Aimbot & Triggerbot
-    local target = GetBestTarget()
+    -- Перебор игроков и raycast'ы — только когда аимбот/триггербот реально нужны.
+    local target = nil
+    if Aura.Aimbot.Enabled or Aura.Aimbot.Triggerbot then
+        target = GetBestTarget()
+    end
     local isAimHotkeyPressed = false
     if typeof(Aura.Aimbot.Keybind) == "EnumItem" then
         if Aura.Aimbot.Keybind.EnumType == Enum.UserInputType then
@@ -1461,17 +1535,25 @@ Conn(RunService.RenderStepped, function(dt)
     end
 
     if Aura.Aimbot.Enabled and isAimHotkeyPressed and target then
-        local pos, onScreen = Camera:WorldToScreenPoint(target.Position)
-        if onScreen then
+        -- WorldToViewportPoint — та же система координат, что в FOV-гейте, ESP
+        -- и у GetMouseLocation (без GUI inset). Раньше здесь был WorldToScreenPoint,
+        -- из-за чего точка прицеливания съезжала по Y на величину верхней панели.
+        local pos, onScreen = Camera:WorldToViewportPoint(target.Position)
+        if onScreen and pos.Z > 0 then
             local targetY = pos.Y + Aura.Aimbot.OffsetY
-            local dx = (pos.X - cx)
-            local dy = (targetY - cy)
+
+            -- mousemoverel двигает курсор ОТНОСИТЕЛЬНО его текущего положения,
+            -- поэтому дельту считаем от реальной позиции мыши, а не от центра
+            -- экрана (совпадает с центром только при залоченной мыши).
+            local mousePos = UserInputService:GetMouseLocation()
+            local dx = pos.X - mousePos.X
+            local dy = targetY - mousePos.Y
             local dist = math.sqrt(dx*dx + dy*dy)
 
             if dist > Aura.Aimbot.Deadzone then
-                local smooth = math.clamp(Aura.Aimbot.Smooth, 1, 30)
-                local moveX = (dx / smooth)
-                local moveY = (dy / smooth)
+                local smooth = math.clamp(Aura.Aimbot.Smooth, 1, 20) -- слайдер Smooth: 1..20
+                local moveX = dx / smooth
+                local moveY = dy / smooth
                 if mousemoverel then
                     mousemoverel(math.clamp(moveX, -150, 150), math.clamp(moveY, -150, 150))
                 else
@@ -1481,16 +1563,31 @@ Conn(RunService.RenderStepped, function(dt)
         end
     end
 
-    -- Triggerbot
-    if Aura.Aimbot.Triggerbot and target and (tick() - lastTriggerTime) >= (Aura.Aimbot.TriggerDelay / 1000) then
-        local pos, onScreen = Camera:WorldToScreenPoint(target.Position)
-        if onScreen then
-            local dist = (Vector2.new(cx, cy) - Vector2.new(pos.X, pos.Y)).Magnitude
-            if dist <= 12 then
-                lastTriggerTime = tick()
-                if mouse1click then mouse1click()
+    -- Triggerbot. Работает только при включённом аимботе, зажатой клавише
+    -- активации и с той же проверкой стен, что и сам аимбот.
+    if Aura.Aimbot.Enabled and Aura.Aimbot.Triggerbot and isAimHotkeyPressed and target and (tick() - lastTriggerTime) >= (Aura.Aimbot.TriggerDelay / 1000) then
+        local pos, onScreen = Camera:WorldToViewportPoint(target.Position)
+        if onScreen and pos.Z > 0 then
+            -- Точка прицеливания с учётом смещения по Y.
+            local aimY = pos.Y + Aura.Aimbot.OffsetY
+            local dist = (Vector2.new(cx, cy) - Vector2.new(pos.X, aimY)).Magnitude
+            -- Порог выстрела привязан к мёртвой зоне: стреляем, когда цель уже
+            -- в зоне, где аимбот перестаёт доводить. Минимум 2px, чтобы при
+            -- Deadzone = 0 не требовалось пиксельной точности.
+            local triggerRadius = math.max(Aura.Aimbot.Deadzone, 2)
+            if dist <= triggerRadius and (not Aura.Aimbot.WallCheck or IsVisible(target)) then
+                -- lastTriggerTime ставим только в момент реального выстрела.
+                if mouse1click then
+                    lastTriggerTime = tick()
+                    mouse1click()
                 elseif mouse1press and mouse1release then
-                    mouse1press(); task.wait(0.02); mouse1release()
+                    lastTriggerTime = tick()
+                    -- task.spawn, чтобы task.wait внутри не замораживал рендер-цикл
+                    task.spawn(function()
+                        mouse1press()
+                        task.wait(0.02)
+                        mouse1release()
+                    end)
                 end
             end
         end
